@@ -1,0 +1,58 @@
+I am looking to develop a python tool to validate Windows workstations before deployment in a production environment.  I want to be able to add more features easily.  I want it to gather data on these three items:
+Windows Defender / AV status and signature freshness
+Firewall profiles (Domain, Private, Public) enabled
+BitLocker encryption status on all drives
+
+Jun 8
+
+Viewed a file, created a file, read a file
+Viewed a file, created a file, read a file
+Here's your modular validation tool. Everything is built around a simple extension pattern — here's how it's organized:
+
+Architecture
+BaseCheck (abstract base class)
+Every check subclasses this and implements one method: run() -> CheckResult. Two PowerShell helpers (_run_ps / _run_ps_json) are available to all checks automatically.
+
+CheckResult (dataclass)
+Carries name, status (PASS/WARN/FAIL/ERROR), summary, details (free-form dict), and an optional remediation string. Everything serializes cleanly to JSON.
+
+CHECKS list
+The registry at the bottom. Adding a new check is literally one line.
+
+The three checks
+Check	What it inspects
+DefenderCheck	AM service, antivirus/antispyware/real-time/behavior monitor enabled; signature age (WARN ≥3 days, FAIL ≥7 days); last quick scan age
+FirewallCheck	Domain, Private, and Public profiles — all must be Enabled: True
+BitLockerCheck	Every volume must be FullyEncrypted with ProtectionStatus: On; reports key protector types (TPM, RecoveryPassword, etc.)
+Usage
+powershell
+# Run all checks (must be Administrator)
+python workstation_validator.py
+
+# Save a full JSON report
+python workstation_validator.py --json C:\reports\ws001.json
+
+# Run only specific checks by name substring
+python workstation_validator.py --checks defender firewall
+Exit code is 0 for PASS/WARN, 1 for any FAIL/ERROR — friendly for CI/automation pipelines.
+
+Adding a new check
+python
+class PatchStatusCheck(BaseCheck):
+    name = "Windows Update / Patch Status"
+
+    def run(self) -> CheckResult:
+        data = self._run_ps_json("Get-HotFix | Sort-Object InstalledOn | ConvertTo-Json")
+        # ... your logic ...
+        return CheckResult(name=self.name, status=STATUS_PASS, summary="All patches current")
+
+# Then add to the registry:
+CHECKS = [
+    DefenderCheck(),
+    FirewallCheck(),
+    BitLockerCheck(),
+    PatchStatusCheck(),   # ← done
+]
+
+Workstation validator
+PY 

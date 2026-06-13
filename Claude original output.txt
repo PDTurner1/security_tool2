@@ -1,0 +1,490 @@
+"""
+workstation_validator_local.py
+Windows Workstation Pre-Deployment Validation Tool
+
+Runs locally on the Windows machine being validated.
+Must be run as Administrator.
+
+Usage:
+    python workstation_validator_local.py
+    python workstation_validator_local.py --json report.json
+    python workstation_validator_local.py --checks defender firewall
+
+To add a new check:
+    1. Subclass BaseCheck
+    2. Set  name = "My Check Name"
+    3. Implement  run(self) -> CheckResult
+    4. Append an instance to CHECKS at the bottom of this file
+"""
+
+# ---------------------------------------------------------------------------
+# Standard library imports — no third-party packages required
+# ---------------------------------------------------------------------------
+import json             # Parsing PowerShell JSON output and writing reports
+import subprocess       # Running PowerShell commands locally
+import sys              # sys.exit() for return codes
+import datetime         # Timestamps and signature age calculation
+import argparse         # Command-line argument parsing
+from abc import ABC, abstractmethod          # Abstract base class support
+from dataclasses import dataclass, field, asdict  # Structured result objects
+from typing import Optional                  # Type hints
+
+
+# ---------------------------------------------------------------------------
+# Status constants
+# ---------------------------------------------------------------------------
+STATUS_PASS  = "PASS"   # Check completed successfully — no issues found
+STATUS_WARN  = "WARN"   # Check completed — something worth noting
+STATUS_FAIL  = "FAIL"   # Check completed — a problem was found
+STATUS_ERROR = "ERROR"  # Check could not complete (e.g. service not running)
+
+
+# ---------------------------------------------------------------------------
+# CheckResult dataclass
+# ---------------------------------------------------------------------------
+# Every check returns exactly one CheckResult.
+# asdict() converts it to a plain dict for JSON serialisation.
+@dataclass
+class CheckResult:
+    name: str                                     # Human-readable check name
+    status: str                                   # One of the STATUS_* constants
+    summary: str                                  # One-line description of outcome
+    details: dict = field(default_factory=dict)  # Structured data for the report
+    remediation: Optional[str] = None            # How to fix it (WARN/FAIL only)
+
+
+# ---------------------------------------------------------------------------
+# BaseCheck — abstract base class for all validation checks
+# ---------------------------------------------------------------------------
+class BaseCheck(ABC):
+    """
+    Subclass this to create a new validation check.
+
+    Example:
+        class MyCheck(BaseCheck):
+            name = "My Check"
+            def run(self) -> CheckResult:
+                data = self._run_ps_json("Some-PSCommand | ConvertTo-Json")
+                return CheckResult(name=self.name, status=STATUS_PASS, summary="All good")
+
+        # Then add to CHECKS at the bottom:
+        CHECKS = [..., MyCheck()]
+    """
+
+    name: str = "Unnamed Check"
+
+    @abstractmethod
+    def run(self) -> CheckResult:
+        """Run the check and return a CheckResult."""
+        ...
+
+    # ------------------------------------------------------------------
+    # PowerShell helpers — available to all checks
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_ps(script: str, timeout: int = 30) -> str:
+        """
+        Run a PowerShell script locally and return stdout as a string.
+        Raises RuntimeError if the script exits with a non-zero return code.
+        """
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NonInteractive",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command", script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0 and result.stderr:
+            raise RuntimeError(result.stderr.strip())
+        return result.stdout.strip()
+
+    @staticmethod
+    def _run_ps_json(script: str, timeout: int = 30) -> object:
+        """
+        Run a PowerShell script that emits JSON and return the parsed object.
+        The caller receives a dict or list depending on what PS returned.
+        """
+        raw = BaseCheck._run_ps(script, timeout)
+        return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Check 1 — Windows Defender / Antivirus
+# ---------------------------------------------------------------------------
+class DefenderCheck(BaseCheck):
+    name = "Windows Defender / Antivirus"
+
+    # Signatures older than WARN_DAYS trigger a warning.
+    # Signatures older than FAIL_DAYS trigger a failure and block deployment.
+    SIGNATURE_WARN_DAYS = 3
+    SIGNATURE_FAIL_DAYS = 7
+
+    def run(self) -> CheckResult:
+        # Fetch all relevant Defender properties in one PowerShell call
+        ps = r"""
+$mp = Get-MpComputerStatus | Select-Object `
+    AMServiceEnabled, AntispywareEnabled, AntivirusEnabled,
+    RealTimeProtectionEnabled, BehaviorMonitorEnabled,
+    AntispywareSignatureLastUpdated, AntivirusSignatureLastUpdated,
+    AntispywareSignatureVersion, AntivirusSignatureVersion,
+    AMEngineVersion, AMProductVersion,
+    QuickScanAge, FullScanAge
+$mp | ConvertTo-Json -Depth 3
+"""
+        try:
+            data = self._run_ps_json(ps)
+        except Exception as exc:
+            return CheckResult(
+                name=self.name, status=STATUS_ERROR,
+                summary=f"Unable to query Defender: {exc}",
+                remediation="Ensure Windows Defender service is running and script is run as Administrator.",
+            )
+
+        # Accumulate problems — issues cause FAIL, warns cause WARN
+        issues, warns = [], []
+
+        # Check that all core protection components are enabled
+        protection_flags = {
+            "AM Service":           data.get("AMServiceEnabled"),
+            "Antispyware":          data.get("AntispywareEnabled"),
+            "Antivirus":            data.get("AntivirusEnabled"),
+            "Real-Time Protection": data.get("RealTimeProtectionEnabled"),
+            "Behavior Monitor":     data.get("BehaviorMonitorEnabled"),
+        }
+        for label, val in protection_flags.items():
+            if val is False:
+                issues.append(f"{label} is disabled")
+
+        # Check signature freshness — PowerShell may return dates in two formats:
+        #   /Date(milliseconds)/  — old WMI-style serialisation
+        #   ISO 8601 string       — newer PowerShell versions
+        sig_age_days = None
+        raw_date = data.get("AntivirusSignatureLastUpdated") or data.get("AntispywareSignatureLastUpdated")
+        if raw_date:
+            try:
+                if raw_date.startswith("/Date("):
+                    ms = int(raw_date[6:raw_date.index(")")])
+                    updated = datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+                else:
+                    updated = datetime.datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                sig_age_days = (datetime.datetime.now(datetime.timezone.utc) - updated).days
+            except Exception:
+                pass  # If date parsing fails, skip the age check
+
+        if sig_age_days is not None:
+            if sig_age_days >= self.SIGNATURE_FAIL_DAYS:
+                issues.append(f"Signatures are {sig_age_days} day(s) old (fail threshold: {self.SIGNATURE_FAIL_DAYS})")
+            elif sig_age_days >= self.SIGNATURE_WARN_DAYS:
+                warns.append(f"Signatures are {sig_age_days} day(s) old (warn threshold: {self.SIGNATURE_WARN_DAYS})")
+
+        # Check that a quick scan has run recently
+        quick_scan_age = data.get("QuickScanAge")
+        if quick_scan_age is not None and quick_scan_age > 7:
+            warns.append(f"Last quick scan was {quick_scan_age} day(s) ago")
+
+        if issues:
+            status, summary = STATUS_FAIL, f"Defender issues: {'; '.join(issues)}"
+        elif warns:
+            status, summary = STATUS_WARN, f"Defender warnings: {'; '.join(warns)}"
+        else:
+            status, summary = STATUS_PASS, "Windows Defender is active and signatures are current"
+
+        return CheckResult(
+            name=self.name, status=status, summary=summary,
+            details={
+                "protection_flags":     protection_flags,
+                "signature_age_days":   sig_age_days,
+                "av_signature_version": data.get("AntivirusSignatureVersion"),
+                "engine_version":       data.get("AMEngineVersion"),
+                "product_version":      data.get("AMProductVersion"),
+                "quick_scan_age_days":  quick_scan_age,
+                "full_scan_age_days":   data.get("FullScanAge"),
+            },
+            remediation=(
+                "Run 'Update-MpSignature' to refresh signatures. "
+                "Enable disabled components via Windows Security or Group Policy."
+            ) if issues or warns else None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Check 2 — Windows Firewall Profiles
+# ---------------------------------------------------------------------------
+class FirewallCheck(BaseCheck):
+    name = "Windows Firewall Profiles"
+
+    def run(self) -> CheckResult:
+        ps = r"Get-NetFirewallProfile | Select-Object Name, Enabled | ConvertTo-Json -Depth 2"
+        try:
+            data = self._run_ps_json(ps)
+        except Exception as exc:
+            return CheckResult(
+                name=self.name, status=STATUS_ERROR,
+                summary=f"Unable to query firewall profiles: {exc}",
+                remediation="Ensure Windows Firewall service is running and script is run as Administrator.",
+            )
+
+        # PS returns a dict when only one profile is found — normalise to list
+        if isinstance(data, dict):
+            data = [data]
+
+        profiles = {p["Name"]: bool(p["Enabled"]) for p in data}
+        disabled = [name for name, enabled in profiles.items() if not enabled]
+
+        if disabled:
+            return CheckResult(
+                name=self.name, status=STATUS_FAIL,
+                summary=f"Firewall profile(s) disabled: {', '.join(disabled)}",
+                details={"profiles": profiles},
+                remediation=f"Set-NetFirewallProfile -Profile {','.join(disabled)} -Enabled True",
+            )
+
+        return CheckResult(
+            name=self.name, status=STATUS_PASS,
+            summary="All firewall profiles (Domain, Private, Public) are enabled",
+            details={"profiles": profiles},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Check 3 — BitLocker Drive Encryption
+# ---------------------------------------------------------------------------
+class BitLockerCheck(BaseCheck):
+    name = "BitLocker Drive Encryption"
+
+    # VolumeStatus values that count as encrypted for this check
+    PROTECTED_STATUSES = {"FullyEncrypted", "EncryptionInProgress"}
+
+    def run(self) -> CheckResult:
+        ps = r"""
+$vols = Get-BitLockerVolume | Select-Object `
+    MountPoint, VolumeStatus, EncryptionPercentage,
+    ProtectionStatus, LockStatus, EncryptionMethod, KeyProtector
+$vols | ConvertTo-Json -Depth 4
+"""
+        try:
+            data = self._run_ps_json(ps)
+        except Exception as exc:
+            return CheckResult(
+                name=self.name, status=STATUS_ERROR,
+                summary=f"Unable to query BitLocker: {exc}",
+                remediation=(
+                    "Ensure BitLocker service is running. "
+                    "Requires Windows 10/11 Pro, Enterprise, or Education."
+                ),
+            )
+
+        if isinstance(data, dict):
+            data = [data]
+
+        # ConvertTo-Json serialises BitLocker enums as integers — translate them
+        VOLUME_STATUS_MAP = {
+            0: "FullyDecrypted",
+            1: "FullyEncrypted",
+            2: "EncryptionInProgress",
+            3: "DecryptionInProgress",
+            4: "EncryptionPaused",
+            5: "DecryptionPaused",
+        }
+        PROTECTION_STATUS_MAP = {0: "Off", 1: "On", 2: "Unknown"}
+        ENCRYPTION_METHOD_MAP = {
+            0: "None", 1: "AES_128_WITH_DIFFUSER", 2: "AES_256_WITH_DIFFUSER",
+            3: "AES_128", 4: "AES_256", 5: "HARDWARE_ENCRYPTION",
+            6: "XtsAes128", 7: "XtsAes256",
+        }
+        KEY_PROTECTOR_MAP = {
+            0: "Unknown", 1: "Tpm", 2: "ExternalKey", 3: "RecoveryPassword",
+            4: "TpmPin", 5: "TpmStartupKey", 6: "TpmPinStartupKey",
+            7: "PublicKey", 8: "Password", 9: "TpmNetworkKey", 10: "AdAccountOrGroup",
+        }
+
+        volumes, unprotected = [], []
+
+        for vol in data:
+            mp      = vol.get("MountPoint", "?")
+            enc_pct = vol.get("EncryptionPercentage", 0)
+
+            vstatus    = VOLUME_STATUS_MAP.get(vol.get("VolumeStatus", 0),    str(vol.get("VolumeStatus")))
+            pstatus    = PROTECTION_STATUS_MAP.get(vol.get("ProtectionStatus", 0), str(vol.get("ProtectionStatus")))
+            enc_method = ENCRYPTION_METHOD_MAP.get(vol.get("EncryptionMethod", 0),  str(vol.get("EncryptionMethod")))
+
+            kp_raw = vol.get("KeyProtector") or []
+            if isinstance(kp_raw, dict):
+                kp_raw = [kp_raw]
+            protectors = [
+                KEY_PROTECTOR_MAP.get(kp.get("KeyProtectorType", 0), str(kp.get("KeyProtectorType")))
+                for kp in kp_raw
+            ]
+
+            fully_enc     = vstatus in self.PROTECTED_STATUSES
+            protection_on = pstatus == "On"
+            secure        = fully_enc and protection_on
+
+            volumes.append({
+                "mount_point":       mp,
+                "volume_status":     vstatus,
+                "protection_status": pstatus,
+                "protection_on":     protection_on,
+                "fully_encrypted":   fully_enc,
+                "encryption_pct":    enc_pct,
+                "encryption_method": enc_method,
+                "key_protectors":    protectors,
+                "secure":            secure,
+            })
+
+            if not secure:
+                unprotected.append(
+                    f"{mp} (status={vstatus}, protection={pstatus}, {enc_pct}% encrypted)"
+                )
+
+        if unprotected:
+            return CheckResult(
+                name=self.name, status=STATUS_FAIL,
+                summary=f"Drive(s) not fully encrypted: {'; '.join(unprotected)}",
+                details={"volumes": volumes},
+                remediation=(
+                    "If BitLocker is suspended: Resume-BitLocker -MountPoint '<drive>'\n"
+                    "If not yet enabled: Enable-BitLocker -MountPoint '<drive>' "
+                    "-EncryptionMethod XtsAes256 -TpmProtector"
+                ),
+            )
+
+        return CheckResult(
+            name=self.name, status=STATUS_PASS,
+            summary=f"All {len(volumes)} drive(s) are BitLocker-protected",
+            details={"volumes": volumes},
+        )
+
+
+# ---------------------------------------------------------------------------
+# CHECKS registry — add new BaseCheck instances here to extend the tool
+# ---------------------------------------------------------------------------
+CHECKS: list[BaseCheck] = [
+    DefenderCheck(),
+    FirewallCheck(),
+    BitLockerCheck(),
+    # MyNewCheck(),   <-- append here to add more checks
+]
+
+
+# ---------------------------------------------------------------------------
+# Report helpers
+# ---------------------------------------------------------------------------
+
+def build_report(results: list[CheckResult]) -> dict:
+    """Roll up all check results into a single report dict."""
+    priority = [STATUS_ERROR, STATUS_FAIL, STATUS_WARN, STATUS_PASS]
+    overall  = STATUS_PASS
+    for r in results:
+        if priority.index(r.status) < priority.index(overall):
+            overall = r.status
+
+    return {
+        "report": {
+            "generated_at":   datetime.datetime.now().isoformat(),
+            "hostname":       _hostname(),
+            "overall_status": overall,
+            "checks_run":     len(results),
+            "pass":  sum(1 for r in results if r.status == STATUS_PASS),
+            "warn":  sum(1 for r in results if r.status == STATUS_WARN),
+            "fail":  sum(1 for r in results if r.status == STATUS_FAIL),
+            "error": sum(1 for r in results if r.status == STATUS_ERROR),
+        },
+        "results": [asdict(r) for r in results],
+    }
+
+
+def _hostname() -> str:
+    try:
+        import socket
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
+
+
+def print_report(report: dict) -> None:
+    """Print a colour-coded summary to stdout."""
+    C = {
+        STATUS_PASS:  "\033[92m",   # Green
+        STATUS_WARN:  "\033[93m",   # Yellow
+        STATUS_FAIL:  "\033[91m",   # Red
+        STATUS_ERROR: "\033[95m",   # Magenta
+    }
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+
+    meta = report["report"]
+    oc   = C.get(meta["overall_status"], "")
+
+    print(f"\n{BOLD}{'='*60}")
+    print(f"  Windows Workstation Validation Report")
+    print(f"  Host   : {meta['hostname']}")
+    print(f"  Time   : {meta['generated_at']}")
+    print(f"  Overall: {oc}{meta['overall_status']}{RST}{BOLD}")
+    print(f"{'='*60}{RST}\n")
+
+    for r in report["results"]:
+        c = C.get(r["status"], "")
+        print(f"  {BOLD}{r['name']}{RST}")
+        print(f"  Status : {c}{r['status']}{RST}")
+        print(f"  Summary: {r['summary']}")
+        if r.get("remediation"):
+            print(f"  Fix    : {r['remediation']}")
+        print()
+
+    print(
+        f"{BOLD}Totals — "
+        f"PASS:{meta['pass']}  WARN:{meta['warn']}  "
+        f"FAIL:{meta['fail']}  ERROR:{meta['error']}{RST}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Validate a Windows workstation before production deployment.",
+        epilog="Must be run as Administrator on the target Windows machine.",
+    )
+    parser.add_argument("--json",   metavar="FILE",
+                        help="Save full JSON report to FILE (e.g. report.json)")
+    parser.add_argument("--checks", nargs="+", metavar="NAME",
+                        help="Run only checks whose names contain these substrings (case-insensitive)")
+    args = parser.parse_args()
+
+    # Filter checks if --checks was supplied
+    checks_to_run = CHECKS
+    if args.checks:
+        filters = [f.lower() for f in args.checks]
+        checks_to_run = [c for c in CHECKS if any(f in c.name.lower() for f in filters)]
+        if not checks_to_run:
+            print(f"No checks matched filter(s): {args.checks}")
+            sys.exit(1)
+
+    print(f"Running {len(checks_to_run)} check(s)…")
+    results = [check.run() for check in checks_to_run]
+
+    report = build_report(results)
+    print_report(report)
+
+    # Optionally save a full JSON report
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, default=str)
+        print(f"JSON report written to: {args.json}")
+
+    # Exit 0 for PASS/WARN, exit 1 for FAIL/ERROR (useful in scripts/CI)
+    worst = report["report"]["overall_status"]
+    sys.exit(0 if worst in (STATUS_PASS, STATUS_WARN) else 1)
+
+
+if __name__ == "__main__":
+    main()
