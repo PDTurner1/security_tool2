@@ -23,7 +23,7 @@ Once these items are complete you can scan a client using the following:
 
 python3 pdwc.py --host <ip_address> --user <username> --json-dir <./<directory>
 
-Example: python3 pdwc.py --host 192.168.12.12 --user testuser --json-dir ./jsonlogs
+Example: python3 pdwc.py --host 192.168.12.12 --user testuser --json-dir ./jsonlogs 
 
 To scan several IP addresses at a time use the --hosts-file option:
 
