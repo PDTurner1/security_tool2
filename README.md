@@ -3,6 +3,7 @@
 Pre-Deployment Workstation Check (PDWC) 1.0 is a tool written in Python to check specific security settings as a pre-deployment check on Windows workstations.  It utilizes python3, pywinRM, and WinRM (Windows Remote Management) to connect to workstations to find the status of various services. The system has three warning levels depending on the severity of what it finds.  This tool can be used as a lightweight checker to be sure Windows workstations are in compliance with build policies.
 
 PDWC checks:
+
 The status of Windows Defender and Antivirus.  The system will detect whether windows defender and antivirus is enabled. It will report if the signature age is out of date and if the quick scan feature has not been run recently.
 
 The status of Windows firewall is checked to be sure it is enabled on Domain, Public, and Private.  It will report which firewalls are disabled, if any.
