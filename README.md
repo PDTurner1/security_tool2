@@ -30,8 +30,11 @@ To scan several IP addresses at a time use the --hosts-file option:
 python3 pdwc.py --host-file hosts.txt --user Administrator --json-dir ./jsonlogs
 
 Where hosts.txt contains:
+
 192.168.12.100
+
 192.168.12.101
+
 192.168.12.102
 
 Please read PDWC documentation for full details.  
