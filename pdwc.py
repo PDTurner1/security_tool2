@@ -4,7 +4,7 @@
 # June 14, 2026
 
 
-#	Pre Deployment workstation check (PDWC 1.0)
+#	Pre Deployment workstation checker (PDWC 1.0)
 #
 #	This program is designed to run on a pre-deployment of workstations into production
 #	to test if Defender/antivirus, Windows firewall, and bitlocker are on and implemented
