@@ -1,3 +1,56 @@
+Tool Updates
+
+New files in the repository:
+
+ToolUpdates.pdf – PDF of this file
+Pdwc_v2.py – version two of workstation checker
+Winrm_teardown.ps1 – PowerShell that reverses changes made in wrm_setup.ps1
+
+YouTube video link
+Link to parallel processing speed video - https://youtu.be/-fe46QZfotM
+
+Summary of updates
+Thank you to my reviewers for providing some great feedback on Tool #2.  My suggestions to improve the tool included the following:
+•	Add more checks to the tool besides the current three.
+•	Have the tool process requests in parallel to speed the process.
+•	Include a script that reverses the changes that wnrm_setup.ps1 makes to the Windows client.
+
+Changes made
+I added another check to the tool that scans the Windows computer for open ports.  The tool has ALLOWED_PORTS and FORBIDDEN_PORTS that can be customized to the security policy.  Default allowed ports include 135, 139 for RPC and NetBIOS Session Service as well as 5985 and 5986 for the tool to work.  Forbidden ports include 23 (telnet), 3389(rdp), 5900 (VNC), 4444 (Metasploit), 1433(sql server), and 3306 (mysql).  The tool warns on unexpected ports that should be checked and will fail on any forbidden ports found open.
+I added parallel processing capabilities to the tool to improve its speed.  The tool now runs all checks simultaneously on the workstation as well as running all workstations simultaneously.  These two additions really made the tools faster and more likely to be used in a corporate environment with many workstations.  This check has a MAX_WORKERS that can be configured to limit the number of checks(threads) that can run simultaneously.  After adding the fourth check and another workstation it scans all 4 workstations with 4 checks in about 10 seconds.  The old version had 3 checks and 3 workstations and took about 20 seconds.  
+I also added a PowerShell script that reverses the changes that wnrm_setup.ps1 makes to the workstation.  The script removes the following: 
+•	removes the firewall rule
+•	removes the self-signed  WinRM certificates
+•	resets TrustedHosts back to empty
+•	disables PowerShell Remoting
+•	removes the HTTP listener
+This script will reset the workstation configuration back to where it was before winrm_setup was run.
+I implemented all the feedback I received.
+
+Lessons Learned
+I learned a great deal from creating this tool.  I continue to improve my understanding of python.  I created this tool so it was in a modular layout, and checks could be added in a systematic way.  I am learning what it takes to develop a small piece of software and the relationships between different portions of code and how they interact.
+I am learning a great deal from my peers on not only my own code but figuring out what they have created and what I need to do to make it run as designed.
+
+Future work if I was to continue this project
+If I were to continue this project, I would like to have the three functions integrated into a seamless system.  I would take the setup script, the main workstation checker program, and the teardown script and integrate them into one seamless package.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # security_tool2
 
 Pre-Deployment Workstation Check (PDWC) 1.0 is a tool written in Python to check specific security settings as a pre-deployment check on Windows workstations.  It utilizes python3, pywinRM, and WinRM (Windows Remote Management) to connect to workstations to find the status of various services. The system has three warning levels depending on the severity of what it finds.  This tool can be used as a lightweight checker to be sure Windows workstations are in compliance with build policies.
